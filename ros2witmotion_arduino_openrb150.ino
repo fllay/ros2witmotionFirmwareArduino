@@ -1,5 +1,5 @@
 #include <micro_ros_arduino.h>
-
+#include <ArduinoHardware.h>
 #include <stdio.h>
 #include <rcl/rcl.h>
 #include <rcl/error_handling.h>
@@ -15,7 +15,7 @@
 
 #include "odometry.h"
 
-#include <DynamixelWorkbench.h>
+#include <Dynamixel2Arduino.h>
 #include "Kinematics.h"
 
 
@@ -39,6 +39,12 @@
 #define BAUDRATE 57600
 #define DXL_ID_LEFT 1
 #define DXL_ID_RIGHT 2
+
+#define DXL_SERIAL Serial1
+#define DEBUG_SERIAL Serial
+const int DXL_DIR_PIN = -1;
+
+const float DXL_PROTOCOL_VERSION = 2.0;
 
 uint8_t dxl_id[2] = { DXL_ID_LEFT, DXL_ID_RIGHT };
 
@@ -83,7 +89,6 @@ unsigned long prev_cmd_time = 0;
 unsigned long prev_odom_update = 0;
 
 Odometry odometry;
-DynamixelWorkbench dxl_wb;
 int32_t present_velocity[2] = { 0, 0 };
 bool result = false;
 const uint8_t handler_index = 0;
@@ -91,6 +96,11 @@ int currentLeftWheelRPM;
 int currentRightWheelRPM;
 
 uint16_t model_number = 0;
+
+Dynamixel2Arduino dxl(DXL_SERIAL, DXL_DIR_PIN);
+
+//This namespace is required to use Control table item names
+using namespace ControlTableItem;
 
 Kinematics kinematics(Kinematics::LINO_BASE, MAX_RPM, WHEEL_DIAMETER, FR_WHEELS_DISTANCE, LR_WHEELS_DISTANCE);
 
@@ -104,47 +114,56 @@ enum states {
 
 void setLeftRPM(int rpm) {
 
-  dxl_wb.goalSpeed(DXL_ID_LEFT, rpm * 100 / 22.9);
+  dxl.setGoalVelocity(DXL_ID_LEFT, rpm, UNIT_RPM);
 }
 
 void setRightRPM(int rpm) {
-  dxl_wb.goalSpeed(DXL_ID_RIGHT, rpm * -100 / 22.9);
+  dxl.setGoalVelocity(DXL_ID_RIGHT, -1*rpm, UNIT_RPM);
 }
 
 
 int getLeftRPM(){
-  result = dxl_wb.syncRead(handler_index);
-  result = dxl_wb.getSyncReadData(handler_index, &present_velocity[0]);
-  int32_t speed = present_velocity[0];
-  double rpm1 = (double)speed * 0.229;
-  currentLeftWheelRPM = (int)rpm1;
+
+  currentLeftWheelRPM = (int) dxl.getPresentVelocity(DXL_ID_LEFT, UNIT_RPM);
   return currentLeftWheelRPM;
 }
 
 
 int getRightRPM() {
-  result = dxl_wb.syncRead(handler_index);
-  result = dxl_wb.getSyncReadData(handler_index, &present_velocity[0]);
-  int32_t speed = present_velocity[1];
-  double rpm1 = (double)speed * -0.229;
-  currentRightWheelRPM = (int)rpm1;
-  return currentRightWheelRPM;
+
+  currentRightWheelRPM = -1* ((int) dxl.getPresentVelocity(DXL_ID_RIGHT, UNIT_RPM));
+  return -1*currentRightWheelRPM;
 }
 
 void setup() {
   const char* log;
   pinMode(LED_PIN, OUTPUT);
   set_microros_transports();
-  dxl_wb.begin(DEVICE_NAME, BAUDRATE);
 
-  for (int cnt = 0; cnt < 2; cnt++) {
-    result = dxl_wb.ping(dxl_id[cnt], &model_number, &log);
-  }
-  dxl_wb.addSyncReadHandler(dxl_id[0], "Present_Velocity", &log);
+  dxl.begin(57600);
+  // Set Port Protocol Version. This has to match with DYNAMIXEL protocol version.
+  dxl.setPortProtocolVersion(DXL_PROTOCOL_VERSION);
+  // Get DYNAMIXEL information
+  dxl.ping(DXL_ID_LEFT);
+
+  // Turn off torque when configuring items in EEPROM area
+  dxl.torqueOff(DXL_ID_LEFT);
+  dxl.setOperatingMode(DXL_ID_LEFT, OP_VELOCITY);
+  dxl.torqueOn(DXL_ID_LEFT);
+  //dxl.setGoalVelocity(DXL_ID_LEFT, 10.0, UNIT_RPM);
+  dxl.setGoalVelocity(DXL_ID_LEFT, 0.0, UNIT_RPM);
+  
+
+  dxl.ping(DXL_ID_RIGHT);
+
+  // Turn off torque when configuring items in EEPROM area
+  dxl.torqueOff(DXL_ID_RIGHT);
+  dxl.setOperatingMode(DXL_ID_RIGHT, OP_VELOCITY);
+  dxl.torqueOn(DXL_ID_RIGHT);
+  //dxl.setGoalVelocity(DXL_ID_RIGHT, 10.0, UNIT_RPM);
+  dxl.setGoalVelocity(DXL_ID_RIGHT, 0.0, UNIT_RPM);
 
 
-  dxl_wb.wheelMode(DXL_ID_LEFT);
-  dxl_wb.wheelMode(DXL_ID_RIGHT);
 }
 
 void loop() {
@@ -177,7 +196,6 @@ void controlCallback(rcl_timer_t* timer, int64_t last_call_time) {
   RCLC_UNUSED(last_call_time);
   if (timer != NULL) {
     moveBase();
-    publishData();
   }
 }
 
@@ -226,6 +244,12 @@ void moveBase() {
     current_vel.linear_x,
     current_vel.linear_y,
     current_vel.angular_z);
+
+  odom_msg = odometry.getData();
+  struct timespec time_stamp = getTime();
+  odom_msg.header.stamp.sec = time_stamp.tv_sec;
+  odom_msg.header.stamp.nanosec = time_stamp.tv_nsec;
+  RCSOFTCHECK(rcl_publish(&odom_publisher, &odom_msg, NULL));
 }
 
 bool createEntities() {
@@ -293,15 +317,6 @@ bool destroyEntities() {
   return true;
 }
 
-
-void publishData() {
-  odom_msg = odometry.getData();
-  struct timespec time_stamp = getTime();
-  odom_msg.header.stamp.sec = time_stamp.tv_sec;
-  odom_msg.header.stamp.nanosec = time_stamp.tv_nsec;
-  RCSOFTCHECK(rcl_publish(&odom_publisher, &odom_msg, NULL));
-
-}
 
 void syncTime() {
   // get the current time from the agent
